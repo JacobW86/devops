@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Extrator de Metadados - Azure DevOps</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px auto; max-width: 900px; padding: 0 20px; color: #333; }
+    h2 { border-bottom: 2px solid #0078d4; padding-bottom: 8px; color: #0078d4; }
+    .form-group { margin-bottom: 15px; }
+    label { display: block; font-weight: 600; margin-bottom: 5px; font-size: 14px; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+    button { background-color: #0078d4; color: white; border: none; padding: 12px 24px; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 600; }
+    button:hover { background-color: #005a9e; }
+    #status { margin-top: 15px; font-weight: bold; color: #555; }
+    textarea { width: 100%; height: 350px; margin-top: 15px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    .help { font-size: 12px; color: #666; margin-top: 3px; }
+  </style>
+</head>
+<body>
+
+  <h2>Extrator de Metadados do Board</h2>
+  <p>Preencha os dados abaixo para inspecionar a estrutura de colunas, campos customizados e histórico dos cards.</p>
+
+  <div class="form-group">
+    <label for="org">Nome da Organização (dev.azure.com/<u>sua-organizacao</u>):</label>
+    <input type="text" id="org" placeholder="ex: minha-empresa">
+  </div>
+
+  <div class="form-group">
+    <label for="project">Nome do Projeto:</label>
+    <input type="text" id="project" placeholder="ex: Projetos Tributarios">
+  </div>
+
+  <div class="form-group">
+    <label for="pat">Personal Access Token (PAT):</label>
+    <input type="password" id="pat" placeholder="Cole seu token aqui">
+    <div class="help">Permissão necessária no PAT: <strong>Work Items (Read)</strong>. Os dados não saem do seu navegador.</div>
+  </div>
+
+  <button id="btnExtrair" onclick="executarExtracao()">Extrair Dados do Board</button>
+  <div id="status"></div>
+
+  <div class="form-group" style="margin-top: 20px;">
+    <label for="resultado">Resumo Gerado (Copie e cole este conteúdo na nossa conversa):</label>
+    <textarea id="resultado" readonly placeholder="O resultado aparecerá aqui..."></textarea>
+  </div>
+
+  <script>
+    async function executarExtracao() {
+      const org = document.getElementById('org').value.trim();
+      const project = document.getElementById('project').value.trim();
+      const pat = document.getElementById('pat').value.trim();
+      const status = document.getElementById('status');
+      const resultado = document.getElementById('resultado');
+
+      if (!org || !project || !pat) {
+        alert('Por favor, preencha a Organização, o Projeto e o PAT.');
+        return;
+      }
+
+      status.innerText = 'Consultando Work Items via WIQL...';
+      resultado.value = '';
+
+      const authHeader = 'Basic ' + btoa(':' + pat);
+      const headers = {
+        'Authorization': authHeader,
+        'Content-Type': 'application/json'
+      };
+
+      try {
+        // 1. Consulta WIQL para pegar os cards mais recentes do projeto
+        const wiqlUrl = `https://dev.azure.com/${org}/${project}/_apis/wit/wiql?api-version=7.0`;
+        const wiqlBody = {
+          query: `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${project}' ORDER BY [System.ChangedDate] DESC`
+        };
+
+        const wiqlRes = await fetch(wiqlUrl, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(wiqlBody)
+        });
+
+        if (!wiqlRes.ok) throw new Error(`Erro na busca WIQL: HTTP ${wiqlRes.status} - ${wiqlRes.statusText}`);
+        const wiqlData = await wiqlRes.json();
+
+        const workItemsRefs = wiqlData.workItems || [];
+        if (workItemsRefs.length === 0) {
+          status.innerText = 'Nenhum card encontrado para este projeto.';
+          return;
+        }
+
+        // Pega até os últimos 100 itens para análise
+        const ids = workItemsRefs.slice(0, 100).map(item => item.id);
+        status.innerText = `Obtendo detalhes de ${ids.length} cards...`;
+
+        // 2. Batch para pegar todos os campos desses itens
+        const detailsUrl = `https://dev.azure.com/${org}/${project}/_apis/wit/workitemsbatch?api-version=7.0`;
+        const detailsRes = await fetch(detailsUrl, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ ids: ids, $expand: "all" })
+        });
+
+        if (!detailsRes.ok) throw new Error(`Erro nos detalhes: HTTP ${detailsRes.status}`);
+        const detailsData = await detailsRes.json();
+
+        status.innerText = 'Mapeando campos customizados e revisões...';
+
+        // Mapear campos únicos existentes
+        const camposDetectados = new Set();
+        const colunasBoard = new Set();
+        const statusWorkItems = new Set();
+        const tiposCards = new Set();
+
+        detailsData.value.forEach(item => {
+          Object.keys(item.fields).forEach(campo => camposDetectados.add(campo));
+          if (item.fields['System.BoardColumn']) colunasBoard.add(item.fields['System.BoardColumn']);
+          if (item.fields['System.State']) statusWorkItems.add(item.fields['System.State']);
+          if (item.fields['System.WorkItemType']) tiposCards.add(item.fields['System.WorkItemType']);
+        });
+
+        // 3. Buscar histórico de revisões de 3 cards para analisar transições de esteira
+        const amostraIds = ids.slice(0, 3);
+        const historicos = [];
+
+        for (let sampleId of amostraIds) {
+          const revUrl = `https://dev.azure.com/${org}/${project}/_apis/wit/workitems/${sampleId}/revisions?api-version=7.0`;
+          const revRes = await fetch(revUrl, { headers: headers });
+          if (revRes.ok) {
+            const revData = await revRes.json();
+            const transitions = revData.value
+              .filter(r => r.fields['System.BoardColumn'] || r.fields['System.State'])
+              .map(r => ({
+                rev: r.rev,
+                date: r.fields['System.ChangedDate'],
+                column: r.fields['System.BoardColumn'] || '(sem coluna)',
+                state: r.fields['System.State'],
+                changedBy: r.fields['System.ChangedBy']?.displayName
+              }));
+            historicos.push({ id: sampleId, transitions });
+          }
+        }
+
+        // 4. Montar o dump resumido de campos customizados e úteis
+        const camposRelevantes = Array.from(camposDetectados)
+          .filter(f => f.startsWith('Custom.') || f.startsWith('Microsoft.VSTS.') || f.startsWith('System.'))
+          .sort();
+
+        // Amostra estrutural do primeiro card
+        const cardExemplo = detailsData.value[0]?.fields || {};
+
+        const output = {
+          totalCardsAnalisados: detailsData.value.length,
+          tiposDeItem: Array.from(tiposCards),
+          colunasDoBoardDetectadas: Array.from(colunasBoard),
+          statesDetectados: Array.from(statusWorkItems),
+          camposDisponiveis: camposRelevantes,
+          amostraCard: {
+            id: detailsData.value[0]?.id,
+            campos: cardExemplo
+          },
+          amostraHistoricoTransicoes: historicos
+        };
+
+        resultado.value = JSON.stringify(output, null, 2);
+        status.innerText = 'Concluído com sucesso! Copie o texto abaixo.';
+
+      } catch (err) {
+        console.error(err);
+        status.innerText = 'Falha na extração: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
